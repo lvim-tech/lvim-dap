@@ -1,0 +1,198 @@
+*lvim-dap.txt*                        A Debug Adapter Protocol client for Neovim
+
+==============================================================================
+CONTENTS                                                       *lvim-dap-contents*
+
+    1. Introduction ............................. |lvim-dap-introduction|
+    2. Requirements ............................. |lvim-dap-requirements|
+    3. Setup .................................... |lvim-dap-setup|
+    4. Adapters (plug-and-play) ................. |lvim-dap-adapters|
+    5. Configurations ........................... |lvim-dap-configurations|
+    6. Breakpoints .............................. |lvim-dap-breakpoints|
+    7. Commands ................................. |lvim-dap-commands|
+    8. API ...................................... |lvim-dap-api|
+    9. Listeners ................................ |lvim-dap-listeners|
+   10. Health ................................... |lvim-dap-health|
+
+==============================================================================
+1. INTRODUCTION                                            *lvim-dap-introduction*
+
+lvim-dap is a Debug Adapter Protocol (DAP) client written in pure Lua. It has
+no native backend: it speaks the DAP JSON-RPC wire protocol to a debug adapter
+over the adapter's stdio, a TCP socket, or a named pipe, and drives the full
+request/response + event loop — sessions, threads, stack frames, scopes,
+variables, stepping, breakpoints, evaluate/REPL, and exceptions.
+
+The companion plugin *lvim-dap-view* renders the debugger UI. lvim-dap works
+without it (breakpoint + stopped gutter signs are engine-owned).
+
+The defining trait is a PLUG-AND-PLAY ADAPTER REGISTRY: a debug adapter is
+ADDED, never wired into the core. See |lvim-dap-adapters|.
+
+==============================================================================
+2. REQUIREMENTS                                            *lvim-dap-requirements*
+
+- Neovim >= 0.10
+- A debug adapter for your language on $PATH (debugpy, delve, js-debug,
+  codelldb, lldb, …). Install with your OS package manager or lvim-installer.
+- lvim-utils (palette, merge, persistence store).
+
+==============================================================================
+3. SETUP                                                          *lvim-dap-setup*
+
+>lua
+    require("lvim-dap").setup({
+        log_level = "warn",
+        stepping_granularity = "statement",
+        auto_use = {},
+        terminal = { command = nil, position = "belowright" },
+        signs = {
+            breakpoint = "",
+            breakpoint_condition = "",
+            breakpoint_rejected = "",
+            log_point = "",
+            stopped = "➤",
+        },
+        persist = { breakpoints = false, last_run = false },
+        on_config = nil,
+    })
+<
+`log_level`             file-log verbosity; log at stdpath("log")/lvim-dap.log
+`stepping_granularity`  "statement" | "line" | "instruction"
+`auto_use`             bundled presets registered on setup, e.g. { "python" }
+`terminal`             runInTerminal window policy
+`signs`                gutter glyphs (engine-owned; theme from the palette)
+`persist.breakpoints`  persist breakpoints per project root across sessions
+`on_config`            fun(config): config — rewrite a config before it runs
+
+==============================================================================
+4. ADAPTERS (PLUG-AND-PLAY)                                    *lvim-dap-adapters*
+
+An adapter is a self-contained registration — no core edits.
+
+register_adapter({type}, {spec})                        *lvim-dap.register_adapter*
+    Register a debug adapter under {type}. {spec} is an adapter table (with a
+    `type` field of "executable" | "server" | "pipe") or a factory function
+    `fun(callback, config, parent)` that resolves one.
+
+    executable: >lua
+        require("lvim-dap").register_adapter("debugpy", {
+            type = "executable",
+            command = "python",
+            args = { "-m", "debugpy.adapter" },
+        })
+<
+    server (TCP, ${port} auto-allocated + a spawned server): >lua
+        require("lvim-dap").register_adapter("pwa-node", {
+            type = "server",
+            host = "127.0.0.1",
+            port = "${port}",
+            executable = { command = "js-debug-adapter", args = { "${port}" } },
+        })
+<
+    The assignment form works too: >lua
+        require("lvim-dap").adapters.debugpy = { type = "executable", … }
+<
+use({name} [, {opts}])                                            *lvim-dap.use*
+    Load a bundled preset `lvim-dap.adapters.<name>` (or any preset-shaped
+    module id) and register what it exposes. Bundled: `python` (debugpy).
+    A preset module returns `{ adapters = {...}, configurations = {...},
+    setup = fun(opts) }` or implements `setup(opts)` and self-registers.
+
+list_adapters()                                          *lvim-dap.list_adapters*
+    Return a report of registered adapters (type, kind, source, filetypes,
+    config count). Drives |:LvimDap| `adapters` and the view's launch chooser.
+
+==============================================================================
+5. CONFIGURATIONS                                        *lvim-dap-configurations*
+
+register_configuration({filetype}, {configs})   *lvim-dap.register_configuration*
+    Append configurations for {filetype}. Each is a table with `type` (an
+    adapter type), `request` ("launch"|"attach"), `name`, plus adapter options.
+
+Configuration string values expand placeholders before a session starts:
+${file} ${fileBasename} ${fileBasenameNoExtension} ${fileDirname}
+${fileExtname} ${relativeFile} ${workspaceFolder} ${workspaceFolderBasename}
+${env:VAR}. A value may also be a function returning the value.
+
+`.vscode/launch.json` is read on demand (JSONC comments + per-OS blocks).
+
+==============================================================================
+6. BREAKPOINTS                                              *lvim-dap-breakpoints*
+
+Breakpoints are extmark-anchored, so they track buffer edits. Four kinds by
+their fields: plain, conditional (`condition`), hit-condition (`hitCondition`),
+and logpoint (`logMessage`, prints instead of stopping). The adapter's
+verified/rejected verdict updates the gutter sign.
+
+toggle_breakpoint([{cond}[, {hit}[, {log}]]])          *lvim-dap.toggle_breakpoint*
+set_breakpoint([{cond}[, {hit}[, {log}]]])                *lvim-dap.set_breakpoint*
+clear_breakpoints([{all}])                              *lvim-dap.clear_breakpoints*
+list_breakpoints([{open}])                               *lvim-dap.list_breakpoints*
+    Manage breakpoints on the current line / list them in the quickfix.
+
+set_exception_breakpoints({filters}[, {opts}])   *lvim-dap.set_exception_breakpoints*
+    Select adapter exception filters (e.g. { "raised", "uncaught" }).
+
+run_to_cursor()                                          *lvim-dap.run_to_cursor*
+    Continue to the cursor line (temporary breakpoint), while stopped.
+
+With `persist.breakpoints = true`, breakpoints are stored per project root and
+restored on BufReadPost.
+
+==============================================================================
+7. COMMANDS                                                    *lvim-dap-commands*
+
+                                                                       *:LvimDap*
+:LvimDap {sub}  Run a subcommand. One of: >
+    continue  run  run_last  step_over  step_into  step_out  step_back
+    up  down  pause  toggle_breakpoint  clear_breakpoints  breakpoints
+    run_to_cursor  terminate  disconnect  close  adapters  log
+<
+`:LvimDap` with no argument is `continue`. `adapters` lists registered
+adapters; `log` opens the log file.
+
+==============================================================================
+8. API                                                              *lvim-dap-api*
+
+Run control ~
+    run({config} [, {opts}])   run_last()   continue([{opts}])
+    run_to_cursor()   restart()   pause([{thread_id}])
+    terminate([{opts}])   disconnect([{opts}[, {cb}]])   close()
+
+Stepping ~
+    step_over([{opts}])   step_into([{opts}])   step_out([{opts}])
+    step_back([{opts}])   reverse_continue([{opts}])
+
+Frames ~
+    up()   down()   focus_frame()
+    set_variable({ref}, {name}, {value} [, {cb}])
+
+Introspection ~
+    session()   sessions()   set_session({s})   status()   list_adapters()
+
+Eval ~
+    evaluate({expr} [, {context}[, {cb}]])   context: repl|hover|watch
+
+==============================================================================
+9. LISTENERS                                                  *lvim-dap-listeners*
+
+Consumers subscribe to the event/request bus (the seam lvim-dap-view uses):
+>lua
+    local dap = require("lvim-dap")
+    dap.listeners.after.event_stopped["me"] = function(session, body) … end
+    dap.listeners.after.frame_updated["me"] = function(session) … end
+    dap.listeners.on_session["me"] = function(old, new) … end
+    dap.listeners.on_config["me"] = function(config) return config end
+<
+`frame_updated` fires after a stop's stack+scopes are fetched (unlike the raw
+`event_stopped`, which precedes the async fetch).
+
+==============================================================================
+10. HEALTH                                                       *lvim-dap-health*
+
+`:checkhealth lvim-dap` reports the Neovim version, lvim-utils availability,
+each registered adapter's executable resolution, loaded presets, and any
+conflicting DAP client.
+
+vim:tw=78:ts=8:ft=help:norl:
