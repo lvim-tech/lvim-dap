@@ -209,20 +209,27 @@ end
 ---@param cbs lvim-dap.transport.Callbacks
 ---@param proc? uv.uv_process_t  a server process we spawned and now own
 local function tcp_connect(host, port, max_retries, cbs, proc)
-    local sock = uv.new_tcp()
-    if not sock then
-        cbs.on_ready("failed to allocate socket")
-        return
-    end
     local attempt = 0
     local function try()
         attempt = attempt + 1
+        -- A FRESH handle per attempt. libuv will not re-connect a uv_tcp_t whose connect FAILED: the
+        -- second `connect` on it never calls back at all, so retrying on the same socket hangs forever —
+        -- no connection, no error. That silently broke every `server` adapter that is not listening the
+        -- instant we dial (i.e. every spawned one: js-debug, codelldb, delve, anything with `${port}`),
+        -- which is exactly what the retry loop exists for.
+        local sock = uv.new_tcp()
+        if not sock then
+            cbs.on_ready("failed to allocate socket")
+            return
+        end
         sock:connect(host, port, function(err)
             if err then
+                pcall(function()
+                    sock:close()
+                end)
                 if attempt <= max_retries then
                     vim.defer_fn(try, 250)
                 else
-                    sock:close()
                     cbs.on_ready(("couldn't connect to %s:%s: %s"):format(host, port, err))
                 end
                 return
@@ -317,21 +324,25 @@ function M.pipe(adapter, cbs)
         end
         proc = h
     end
-    local sock = uv.new_pipe(false)
-    if not sock then
-        cbs.on_ready("failed to allocate pipe")
-        return
-    end
     local timeout = (adapter.options or {}).timeout or 5000
     local elapsed = 0
     local function try()
+        -- Fresh handle per attempt — see tcp_connect: a uv handle whose connect failed is dead, and
+        -- re-connecting it never calls back, so the retry loop would hang instead of retrying.
+        local sock = uv.new_pipe(false)
+        if not sock then
+            cbs.on_ready("failed to allocate pipe")
+            return
+        end
         sock:connect(pipe_path, function(err)
             if err then
+                pcall(function()
+                    sock:close()
+                end)
                 elapsed = elapsed + 100
                 if elapsed < timeout then
                     vim.defer_fn(try, 100)
                 else
-                    sock:close()
                     cbs.on_ready(("couldn't connect to pipe %s: %s"):format(pipe_path, err))
                 end
                 return

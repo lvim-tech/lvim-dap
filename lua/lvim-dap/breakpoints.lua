@@ -104,6 +104,13 @@ end
 ---@return integer mark_id
 local function place(bufnr, line, m, id)
     local glyph, hl = sign_style(sign_for(m))
+    -- An EMPTY glyph is not a sign: nvim then stores the extmark with no `sign_text`, and every gutter
+    -- reader (the native signcolumn, a custom statuscolumn) skips it — the breakpoint exists but is
+    -- INVISIBLE. Refuse to place a signless mark: fall back to the default glyph, so a misconfigured
+    -- icon degrades to a visible breakpoint instead of a silent one.
+    if glyph == nil or glyph == "" then
+        glyph = "\u{f111}"
+    end
     return vim.api.nvim_buf_set_extmark(bufnr, ns, line - 1, 0, {
         id = id,
         sign_text = glyph,
@@ -355,15 +362,35 @@ function M.restore_buffer(bufnr)
     log.debug("breakpoints: restored", #list, "for", rel)
 end
 
+--- Re-persist a buffer's breakpoints at their CURRENT lines. Public because the lines drift under
+--- editing (that is the whole point of anchoring them to extmarks) while the on-disk copy is only
+--- rewritten when a breakpoint is toggled — so without this, editing above a breakpoint and restarting
+--- restored it at its OLD line, i.e. onto the wrong statement.
+---@param bufnr integer
+function M.persist_buffer(bufnr)
+    if vim.api.nvim_buf_is_valid(bufnr) then
+        persist(bufnr)
+    end
+end
+
 --- Install the restore autocmd (idempotent). Called from init.setup when persistence is enabled.
 function M.setup_persistence()
     if not config.persist.breakpoints then
         return
     end
+    local group = vim.api.nvim_create_augroup("lvim-dap.breakpoints.restore", { clear = true })
     vim.api.nvim_create_autocmd("BufReadPost", {
-        group = vim.api.nvim_create_augroup("lvim-dap.breakpoints.restore", { clear = true }),
+        group = group,
         callback = function(ev)
             M.restore_buffer(ev.buf)
+        end,
+    })
+    -- Writing the file is when the buffer's lines become the truth on disk — so it is exactly when the
+    -- breakpoints' (extmark-tracked, possibly shifted) lines must be re-persisted.
+    vim.api.nvim_create_autocmd("BufWritePost", {
+        group = group,
+        callback = function(ev)
+            M.persist_buffer(ev.buf)
         end,
     })
     -- Restore already-loaded buffers too (setup may run after files open).

@@ -192,7 +192,9 @@ function Session:request(command, arguments, on_result)
     local awaiting = on_result == nil and async.in_coroutine()
     self.message_callbacks[seq] = function(err, body)
         if awaiting then
-            coroutine.resume(co, err, body)
+            -- through async.resume, so an error raised in the awaiting code is LOGGED + surfaced
+            -- rather than silently killing the coroutine mid-handshake
+            async.resume(co, err, body)
         elseif on_result then
             on_result(err, body)
         end
@@ -646,6 +648,16 @@ function Session:close()
     end
     self.closed = true
     log.info("session", self.id, "closing")
+    -- FAIL every in-flight request before tearing the transport down. Their replies can never arrive
+    -- now, and each pending callback is either an awaiting COROUTINE — which would otherwise be
+    -- suspended forever, leaking it and abandoning whatever it was mid-way through (a handshake, a
+    -- stack fetch) — or a caller's `on_result`, which would simply never be told. An adapter that dies
+    -- mid-request is the normal case here, not an exotic one.
+    local pending = self.message_callbacks
+    self.message_callbacks = {}
+    for _, cb in pairs(pending) do
+        pcall(cb, { message = "session closed" }, nil)
+    end
     if self.client then
         self.client.close()
         self.client = nil

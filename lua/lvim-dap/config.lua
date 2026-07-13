@@ -23,7 +23,7 @@
 ---@field log_level            lvim-dap.log.Level   file-log verbosity (trace|debug|info|warn|error)
 ---@field stepping_granularity "statement"|"line"|"instruction"  default step granularity
 ---@field auto_use             string[]             bundled adapter presets to register on setup
----@field terminal             { command: string?, position: string }  runInTerminal window policy
+---@field terminal             { command: string?, position: string, close_on_exit: boolean }  runInTerminal window policy
 ---@field signs                LvimDapSignsConfig
 ---@field persist              LvimDapPersistConfig
 ---@field on_config?           fun(config: table): table|nil  last-chance config rewrite before run
@@ -38,12 +38,20 @@ return {
     terminal = {
         command = nil, -- external terminal command template; nil = integrated terminal buffer
         position = "belowright",
+        -- Close the debuggee's terminal (window + buffer) when its session ends. The window is the
+        -- engine's own — without this every debug run leaves another dead terminal split behind.
+        -- Set false to keep it: with `runInTerminal` the program's output goes to that terminal and
+        -- NOT to the Console panel, so keeping it is the only way to read it after the run.
+        close_on_exit = true,
     },
     signs = {
-        breakpoint = "",
-        breakpoint_condition = "",
-        breakpoint_rejected = "",
-        log_point = "",
+        -- Nerd Font, all single-width (verified with strdisplaywidth). These were EMPTY strings, which
+        -- meant a breakpoint's extmark carried no `sign_text` at all — so breakpoints were invisible in
+        -- the gutter / statuscolumn: set one and nothing appeared.
+        breakpoint = "\u{f111}", -- ● a plain breakpoint
+        breakpoint_condition = "\u{f192}", -- ◉ a conditional one
+        breakpoint_rejected = "\u{f057}", -- ✖ the adapter refused it
+        log_point = "\u{f27b}", -- 󰍡 a logpoint (prints, never stops)
         stopped = "➤",
     },
     persist = {

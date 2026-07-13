@@ -171,7 +171,31 @@ end
 
 -- ── reverse request handlers ─────────────────────────────────────────────────
 
+--- Close the debuggee terminal a session opened (its window AND its buffer). No-op when the session
+--- opened none, or when the user opted to keep it (`terminal.close_on_exit = false` — to read the
+--- program's last output, which with `runInTerminal` never reaches the Console panel).
+---@param s lvim-dap.Session
+local function close_terminal(s)
+    local buf = s and s.term_buf
+    s.term_buf = nil
+    if not buf or config.terminal.close_on_exit == false then
+        return
+    end
+    if not vim.api.nvim_buf_is_valid(buf) then
+        return
+    end
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+            pcall(vim.api.nvim_win_close, win, true)
+        end
+    end
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+end
+
 --- Answer `runInTerminal`: run the debuggee command in a terminal buffer and report its PID.
+--- The window is OURS (we open it), so its lifecycle is ours too — `close_terminal` tears it down
+--- when the session ends (`config.terminal.close_on_exit`); otherwise every debug run left another
+--- dead terminal split behind, forever.
 ---@param s lvim-dap.Session
 ---@param request table
 local function handle_run_in_terminal(s, request)
@@ -183,6 +207,15 @@ local function handle_run_in_terminal(s, request)
     local term_buf = vim.api.nvim_get_current_buf()
     local job = vim.fn.termopen(cmd, { cwd = args.cwd, env = args.env })
     s.term_buf = term_buf
+    -- The terminal dies WITH the session that spawned it. `Session:close()` is the single funnel every
+    -- ending path runs through (a `terminated` event, an explicit terminate/disconnect, a dead adapter),
+    -- so its on_close hook — not the event listeners, which some of those paths never emit — is what
+    -- guarantees no orphan terminal is ever left behind.
+    s.on_close["lvim-dap.terminal"] = function(closed)
+        vim.schedule(function()
+            close_terminal(closed)
+        end)
+    end
     vim.api.nvim_set_current_win(prev)
     local pid = job > 0 and vim.fn.jobpid(job) or nil
     s:respond(request, { processId = pid }, pid ~= nil, pid and nil or "failed to start terminal")

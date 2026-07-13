@@ -13,22 +13,30 @@ local log = require("lvim-dap.log")
 
 local M = {}
 
+--- Resume `co`, SURFACING a failure instead of swallowing it. Every resume must go through here.
+--- `coroutine.resume` returns `false, err` on an error inside the coroutine — a bare call therefore
+--- DISCARDS it. Only the initial `run` step used to check, so any error raised AFTER the first await
+--- (i.e. in every reply handler — the bulk of the engine's logic) vanished without a trace: no log, no
+--- notification, the debug session simply stopped doing anything.
+---@param co thread
+---@param ... any  values passed into the coroutine's pending `yield`
+function M.resume(co, ...)
+    local ok, err = coroutine.resume(co, ...)
+    if not ok then
+        log.error("async: coroutine failed:", err)
+        vim.schedule(function()
+            vim.notify("lvim-dap: " .. tostring(err), vim.log.levels.ERROR)
+        end)
+    end
+end
+
 --- Run `fn` inside a fresh coroutine. Uncaught errors are logged (and surfaced via notify),
 --- never silently dropped. Returns the coroutine so callers can resume it from a reply handler.
 ---@param fn fun()
 ---@return thread
 function M.run(fn)
     local co = coroutine.create(fn)
-    local function step(...)
-        local ok, err = coroutine.resume(co, ...)
-        if not ok then
-            log.error("async: coroutine failed:", err)
-            vim.schedule(function()
-                vim.notify("lvim-dap: " .. tostring(err), vim.log.levels.ERROR)
-            end)
-        end
-    end
-    step()
+    M.resume(co)
     return co
 end
 
@@ -45,7 +53,7 @@ function M.schedule_back()
     if vim.in_fast_event() and M.in_coroutine() then
         local co = coroutine.running()
         vim.schedule(function()
-            coroutine.resume(co)
+            M.resume(co)
         end)
         coroutine.yield()
     end

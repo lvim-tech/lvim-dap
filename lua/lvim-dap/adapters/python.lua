@@ -60,6 +60,20 @@ function M.setup(opts)
             name = "Launch file",
             program = "${file}",
             pythonPath = debug_python,
+            -- internalConsole (NOT integratedTerminal): the debuggee's stdout then arrives as DAP
+            -- `output` events, which lvim-dap-view renders in its CONSOLE panel — where the rest of
+            -- the session already lives. `integratedTerminal` would instead open a separate terminal
+            -- split, leaving the Console panel empty. Use the "(terminal)" config below when the
+            -- program needs STDIN — that is the one thing internalConsole cannot give it.
+            console = "internalConsole",
+            cwd = "${workspaceFolder}",
+        },
+        {
+            type = "debugpy",
+            request = "launch",
+            name = "Launch file (terminal, for stdin)",
+            program = "${file}",
+            pythonPath = debug_python,
             console = "integratedTerminal",
             cwd = "${workspaceFolder}",
         },
