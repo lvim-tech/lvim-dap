@@ -158,8 +158,9 @@ require("lvim-dap").setup({
     stepping_granularity = "statement", -- statement | line | instruction
     auto_use = {}, -- bundled presets to register on setup, e.g. { "python" }
     terminal = {
-        command = nil, -- external terminal command template; nil = integrated terminal buffer
-        position = "belowright",
+        command = nil, -- external terminal template, e.g. "alacritty -e"; nil = integrated split
+        position = "belowright", -- where the integrated terminal split opens
+        close_on_exit = true, -- close the integrated terminal (window + buffer) when the session ends
     },
     signs = {
         breakpoint = "",
@@ -170,7 +171,7 @@ require("lvim-dap").setup({
     },
     persist = {
         breakpoints = false, -- persist breakpoints per project root across sessions
-        last_run = false, -- remember the last configuration run per project
+        last_run = false, -- RESERVED: not yet implemented (run_last is in-memory only)
     },
     on_config = nil, -- fun(config): config — last-chance rewrite of a configuration before it runs
 })

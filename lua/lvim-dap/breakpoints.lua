@@ -101,8 +101,24 @@ end
 ---@param line integer  1-based
 ---@param m table  metadata
 ---@param id? integer  existing mark id to reuse
----@return integer mark_id
+---@return integer? mark_id  nil when the buffer is not loaded (nothing placed)
 local function place(bufnr, line, m, id)
+    -- Guard the mark API against a line that no longer exists. `restore_buffer` places at the PERSISTED
+    -- line and `set_verified` at an adapter-reported one, either of which can exceed the buffer's
+    -- CURRENT line count (the file shrank since — edited elsewhere, a git checkout). `nvim_buf_set_extmark`
+    -- would then throw E5108 ("line value outside range") from inside a BufReadPost autocmd. Clamping to
+    -- the last line (the root-cause fix, not a pcall swallow) keeps the breakpoint visible and lets it
+    -- re-persist at its live line on the next write.
+    if not vim.api.nvim_buf_is_loaded(bufnr) then
+        return nil
+    end
+    local max = vim.api.nvim_buf_line_count(bufnr)
+    if line > max then
+        line = max
+    end
+    if line < 1 then
+        line = 1
+    end
     local glyph, hl = sign_style(sign_for(m))
     -- An EMPTY glyph is not a sign: nvim then stores the extmark with no `sign_text`, and every gutter
     -- reader (the native signcolumn, a custom statuscolumn) skips it — the breakpoint exists but is
@@ -131,15 +147,21 @@ local function marks_in(bufnr)
     return out
 end
 
---- The breakpoint mark (id + line) at a given line in a buffer, if any.
+--- The breakpoint mark (id + line) at a given line in a buffer, if any. Uses the extmark API's
+--- positional lookup (one call, no table build) instead of scanning every mark in the buffer.
 ---@param bufnr integer
 ---@param line integer  1-based
 ---@return { id: integer, line: integer }?
 local function mark_at(bufnr, line)
-    for _, mk in ipairs(marks_in(bufnr)) do
-        if mk.line == line then
-            return mk
-        end
+    -- A row outside the buffer holds no mark (marks are anchored within it): return nil rather than
+    -- letting the API reject an out-of-range position (an adapter can report a line past EOF).
+    if line < 1 or line > vim.api.nvim_buf_line_count(bufnr) then
+        return nil
+    end
+    local raw = vim.api.nvim_buf_get_extmarks(bufnr, ns, { line - 1, 0 }, { line - 1, -1 }, { limit = 1 })
+    local mk = raw[1]
+    if mk then
+        return { id = mk[1], line = mk[2] + 1 }
     end
 end
 
@@ -202,6 +224,9 @@ function M.toggle(bufnr, line, opts)
         logMessage = opts.log_message,
     }
     local id = place(bufnr, line, m, existing and existing.id or nil)
+    if not id then
+        return
+    end
     meta[bufnr] = meta[bufnr] or {}
     meta[bufnr][id] = m
     persist(bufnr)
@@ -355,8 +380,10 @@ function M.restore_buffer(bufnr)
         if not mark_at(bufnr, bp.line) then
             local m = { condition = bp.condition, hitCondition = bp.hitCondition, logMessage = bp.logMessage }
             local id = place(bufnr, bp.line, m)
-            meta[bufnr] = meta[bufnr] or {}
-            meta[bufnr][id] = m
+            if id then
+                meta[bufnr] = meta[bufnr] or {}
+                meta[bufnr][id] = m
+            end
         end
     end
     log.debug("breakpoints: restored", #list, "for", rel)
@@ -371,6 +398,22 @@ function M.persist_buffer(bufnr)
     if vim.api.nvim_buf_is_valid(bufnr) then
         persist(bufnr)
     end
+end
+
+--- Install the buffer-lifecycle autocmd (idempotent). Called UNCONDITIONALLY from init.setup — it is
+--- NOT gated on persistence. Extmarks die with their buffer, but the parallel `meta` table (condition/
+--- log/verified state keyed by bufnr → mark id) does not. Neovim REUSES buffer numbers and restarts
+--- extmark ids per namespace, so without this a new buffer that reuses a wiped buffer's number could
+--- resolve a fresh mark id against the OLD buffer's metadata — a plain breakpoint silently inheriting a
+--- stale condition (then pushed to the adapter). Dropping `meta[buf]` on BufWipeout closes that seam.
+function M.setup_lifecycle()
+    local group = vim.api.nvim_create_augroup("lvim-dap.breakpoints.lifecycle", { clear = true })
+    vim.api.nvim_create_autocmd("BufWipeout", {
+        group = group,
+        callback = function(ev)
+            meta[ev.buf] = nil
+        end,
+    })
 end
 
 --- Install the restore autocmd (idempotent). Called from init.setup when persistence is enabled.

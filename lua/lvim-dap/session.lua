@@ -169,7 +169,7 @@ end
 ---@param command string
 ---@param arguments any?
 ---@param on_result fun(err: table?, body: any)?
----@return table? err, any body
+---@return table? err, any body, integer? seq  (callback-style calls get the request `seq` third)
 function Session:request(command, arguments, on_result)
     if self.closed or not self.client then
         if on_result then
@@ -206,6 +206,9 @@ function Session:request(command, arguments, on_result)
     if awaiting then
         return coroutine.yield()
     end
+    -- Callback-style: hand back the seq so a caller (request_with_timeout) can drop the pending entry
+    -- from `message_callbacks` when it gives up, instead of leaking a dead callback until close.
+    return nil, nil, seq
 end
 
 --- Same as `request` but fails the callback if no reply arrives within `timeout_ms`.
@@ -216,17 +219,20 @@ end
 function Session:request_with_timeout(command, arguments, timeout_ms, on_result)
     local done = false
     local timer = uv.new_timer()
-    self:request(command, arguments, function(err, body)
-        if done then
-            return
-        end
-        done = true
-        if timer then
-            timer:stop()
-            timer:close()
-        end
-        on_result(err, body)
-    end)
+    local seq = select(
+        3,
+        self:request(command, arguments, function(err, body)
+            if done then
+                return
+            end
+            done = true
+            if timer then
+                timer:stop()
+                timer:close()
+            end
+            on_result(err, body)
+        end)
+    )
     if timer then
         timer:start(timeout_ms, 0, function()
             if done then
@@ -235,6 +241,11 @@ function Session:request_with_timeout(command, arguments, timeout_ms, on_result)
             done = true
             timer:stop()
             timer:close()
+            -- Drop the pending callback: its reply can never usefully arrive now, and leaving it in
+            -- `message_callbacks` accumulates dead entries (which are also the set `close()` fails over).
+            if seq then
+                self.message_callbacks[seq] = nil
+            end
             vim.schedule(function()
                 on_result({ message = "request timed out: " .. command }, nil)
             end)
@@ -392,13 +403,25 @@ end
 ---@param stopped table  dap.StoppedEvent body
 function Session:event_stopped(stopped)
     async.run(function()
-        self.stopped_thread_id = stopped.threadId
         self:update_threads()
-        if not stopped.threadId then
+        -- Per DAP a `stopped` event MAY omit `threadId` when `allThreadsStopped` is set (some gdb/lldb
+        -- `pause` configurations stop-all without one). Falling through with a nil thread left the UI on
+        -- "running" and never jumped the editor. Pick the lowest known thread id so the normal fetch/jump
+        -- path still runs; only give up when there is genuinely no thread.
+        local tid = stopped.threadId
+        if not tid then
+            for id in pairs(self.threads) do
+                if not tid or id < tid then
+                    tid = id
+                end
+            end
+        end
+        self.stopped_thread_id = tid
+        if not tid then
             return
         end
-        local frames = self:fetch_stack(stopped.threadId)
-        local thread = self.threads[stopped.threadId]
+        local frames = self:fetch_stack(tid)
+        local thread = self.threads[tid]
         if thread then
             thread.stopped = true
             thread.frames = frames

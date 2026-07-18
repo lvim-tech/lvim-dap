@@ -41,6 +41,13 @@ M.providers = { configs = {} }
 ---@type table<string, boolean>
 local loaded_modules = {}
 
+--- Provenance by adapter TYPE: which preset name registered each type via `use()`. Distinct from
+--- `loaded_modules` (keyed by the PRESET name, e.g. "python") — a preset's adapter type differs from
+--- its name (e.g. `use("python")` registers the "debugpy" type), which is why `list_adapters` needs
+--- this map to mark preset-loaded adapters as "preset" rather than mislabelling them "custom".
+---@type table<string, string>
+local preset_types = {}
+
 --- Register a debug adapter under `type`. `spec` is a nvim-dap-shaped adapter table (with a
 --- `type` field of "executable" | "server" | "pipe") or a factory function that resolves one.
 --- Re-registering the same key replaces it (last wins), so a user can override a bundled preset.
@@ -49,7 +56,7 @@ local loaded_modules = {}
 function M.register_adapter(type, spec)
     assert(type and type ~= "", "register_adapter: `type` must be a non-empty string")
     assert(
-        vim.is_callable(spec) or (vim.is_callable and vim.is_callable(spec)) or _G.type(spec) == "table",
+        vim.is_callable(spec) or _G.type(spec) == "table",
         "register_adapter: `spec` must be an adapter table or a factory function"
     )
     M.adapters[type] = spec
@@ -110,6 +117,13 @@ function M.use(name, opts)
         log.error("registry: failed to load preset", modname, mod)
         return false, tostring(mod)
     end
+    -- Snapshot the adapter types present BEFORE the preset registers so we can attribute the ones it
+    -- adds to this preset (a preset registers via `setup`, whose adapter type — "debugpy" — differs
+    -- from the preset name — "python"; this is the only reliable seam to record which is which).
+    local before = {}
+    for atype in pairs(M.adapters) do
+        before[atype] = true
+    end
     if type(mod) == "table" then
         for atype, spec in pairs(mod.adapters or {}) do
             M.register_adapter(atype, spec)
@@ -122,6 +136,11 @@ function M.use(name, opts)
         end
     elseif vim.is_callable(mod) then
         mod(opts)
+    end
+    for atype in pairs(M.adapters) do
+        if not before[atype] then
+            preset_types[atype] = name
+        end
     end
     loaded_modules[name] = true
     return true
@@ -183,7 +202,7 @@ function M.list_adapters()
         out[#out + 1] = {
             type = atype,
             kind = kind,
-            source = loaded_modules[atype] and "preset" or "custom",
+            source = preset_types[atype] and "preset" or "custom",
             filetypes = fts,
             config_count = count_by_type[atype] or 0,
         }

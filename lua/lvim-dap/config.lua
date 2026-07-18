@@ -17,7 +17,7 @@
 
 ---@class LvimDapPersistConfig
 ---@field breakpoints boolean  persist breakpoints per project across sessions
----@field last_run    boolean  remember the last configuration run per project
+---@field last_run    boolean  RESERVED (not yet implemented): remember the last run per project
 
 ---@class LvimDapConfig
 ---@field log_level            lvim-dap.log.Level   file-log verbosity (trace|debug|info|warn|error)
@@ -36,7 +36,10 @@ return {
     -- the user opts in — nothing is hardcoded into the engine.
     auto_use = {},
     terminal = {
-        command = nil, -- external terminal command template; nil = integrated terminal buffer
+        -- External terminal command template (e.g. "alacritty -e"): when set, a `runInTerminal`
+        -- request runs the debuggee in that emulator (spawned detached) instead of an integrated
+        -- split. nil = the integrated terminal buffer (the default).
+        command = nil,
         position = "belowright",
         -- Close the debuggee's terminal (window + buffer) when its session ends. The window is the
         -- engine's own — without this every debug run leaves another dead terminal split behind.
@@ -56,7 +59,7 @@ return {
     },
     persist = {
         breakpoints = false,
-        last_run = false,
+        last_run = false, -- RESERVED: not yet implemented (run_last is in-memory only, per Neovim session)
     },
     on_config = nil,
 }

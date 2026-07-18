@@ -2,7 +2,8 @@
 -- The DAP conversation is asynchronous and easy to get wrong (a dropped seq, a malformed
 -- frame, an adapter that dies mid-handshake), and none of it is visible in the editor. So
 -- every request/response/event and every transport lifecycle step is written here with a
--- millisecond timestamp; when a debug session misbehaves this file is the ground truth.
+-- wall-clock HH:MM:SS.mmm timestamp — correlatable with other logs / the adapter's own output;
+-- when a debug session misbehaves this file is the ground truth.
 -- Writing is gated by the level (default WARN) so a normal session costs nothing; turn it up
 -- with `require("lvim-dap").set_log_level("trace")` (or via config.log_level) to capture a
 -- full transcript. The file lives at stdpath("log")/lvim-dap.log and is opened lazily on the
@@ -82,7 +83,17 @@ local function write(level, ...)
         local v = select(i, ...)
         parts[#parts + 1] = type(v) == "string" and v or vim.inspect(v)
     end
-    f:write(("%10.1f  %-5s  %s\n"):format(vim.uv.hrtime() / 1e6, level:upper(), table.concat(parts, " ")))
+    -- Wall clock, not hrtime: hrtime() is nanoseconds since an arbitrary origin — an opaque huge
+    -- number that correlates with nothing. gettimeofday gives seconds + microseconds since the epoch.
+    local sec, usec = vim.uv.gettimeofday()
+    f:write(
+        ("%s.%03d  %-5s  %s\n"):format(
+            os.date("%H:%M:%S", sec),
+            math.floor((usec or 0) / 1000),
+            level:upper(),
+            table.concat(parts, " ")
+        )
+    )
     f:flush()
 end
 

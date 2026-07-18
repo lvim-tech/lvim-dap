@@ -45,7 +45,7 @@ ADDED, never wired into the core. See |lvim-dap-adapters|.
         log_level = "warn",
         stepping_granularity = "statement",
         auto_use = {},
-        terminal = { command = nil, position = "belowright" },
+        terminal = { command = nil, position = "belowright", close_on_exit = true },
         signs = {
             breakpoint = "",
             breakpoint_condition = "",
@@ -60,9 +60,12 @@ ADDED, never wired into the core. See |lvim-dap-adapters|.
 `log_level`             file-log verbosity; log at stdpath("log")/lvim-dap.log
 `stepping_granularity`  "statement" | "line" | "instruction"
 `auto_use`             bundled presets registered on setup, e.g. { "python" }
-`terminal`             runInTerminal window policy
+`terminal.command`     external terminal template (e.g. "alacritty -e"); nil = integrated
+`terminal.position`    where the integrated terminal split opens
+`terminal.close_on_exit` close the integrated terminal when the session ends
 `signs`                gutter glyphs (engine-owned; theme from the palette)
 `persist.breakpoints`  persist breakpoints per project root across sessions
+`persist.last_run`     RESERVED: not yet implemented (run_last is in-memory only)
 `on_config`            fun(config): config — rewrite a config before it runs
 
 ==============================================================================
@@ -130,6 +133,8 @@ set_breakpoint([{cond}[, {hit}[, {log}]]])                *lvim-dap.set_breakpoi
 clear_breakpoints([{all}])                              *lvim-dap.clear_breakpoints*
 list_breakpoints([{open}])                               *lvim-dap.list_breakpoints*
     Manage breakpoints on the current line / list them in the quickfix.
+    `clear_breakpoints(true)` clears EVERY buffer's breakpoints and unsets them
+    in every live session too (not just the current buffer).
 
 set_exception_breakpoints({filters}[, {opts}])   *lvim-dap.set_exception_breakpoints*
     Select adapter exception filters (e.g. { "raised", "uncaught" }).

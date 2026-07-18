@@ -1,8 +1,10 @@
 -- lvim-dap.adapters.python: the bundled debugpy preset (a pluggable adapter module).
--- This is the SHAPE every adapter preset follows — bundled or third-party: a self-contained
--- module that exposes `adapters` (nvim-dap-shaped specs), `configurations` (per filetype), and
--- an optional `setup(opts)` for customization. The user opts in with
--- `require("lvim-dap").use("python", { python = "…" })` — ZERO core edits, exactly like
+-- This is the SHAPE every adapter preset follows — bundled or third-party. The preset protocol
+-- (registry.use) accepts EITHER static `adapters`/`configurations` tables OR a `setup(opts)` that
+-- self-registers. This preset is SETUP-ONLY: its adapter command + the configs' `pythonPath` are
+-- computed from `resolve_python(opts)` at setup time (the interpreter can't be a static constant),
+-- so there is nothing correct to put in static tables — `setup` registers everything. The user opts
+-- in with `require("lvim-dap").use("python", { python = "…" })` — ZERO core edits, exactly like
 -- lvim-cmp's register_source. Nothing about debugpy is known to the engine; it is discovered
 -- through the registry like any other adapter.
 --
@@ -95,9 +97,5 @@ function M.setup(opts)
         },
     })
 end
-
--- Also expose the static shape so `use()` can register without calling setup (defaults).
-M.adapters = {}
-M.configurations = {}
 
 return M

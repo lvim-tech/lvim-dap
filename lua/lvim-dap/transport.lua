@@ -71,12 +71,28 @@ end
 ---@param stream uv.uv_stream_t
 ---@param cbs lvim-dap.transport.Callbacks
 local function pump(stream, cbs)
-    stream:read_start(rpc.create_read_loop(cbs.on_body, function()
+    -- Both a real EOF and a decode error end the stream irrecoverably; funnel both through one
+    -- guarded `finish` so the session is torn down exactly once. A decode error on a framed stream is
+    -- unrecoverable BY DEFINITION — the parser coroutine is now dead, so every further chunk would only
+    -- re-error — so we treat it as EOF: stop reading and fire on_exit (→ Session:close, which fails the
+    -- pending requests and runs on_close). Before this, a stray non-DAP line on an adapter's stdout only
+    -- logged and the session hung forever with a live adapter process.
+    local finished = false
+    local function finish()
+        if finished then
+            return
+        end
+        finished = true
+        pcall(function()
+            stream:read_stop()
+        end)
         if cbs.on_exit then
             cbs.on_exit()
         end
-    end, function(msg)
+    end
+    stream:read_start(rpc.create_read_loop(cbs.on_body, finish, function(msg)
         log.error("transport: decode error:", msg)
+        finish()
     end))
 end
 
@@ -142,11 +158,12 @@ local function spawn(command, args, opts, cbs)
 
     local env
     if opts.env then
+        -- Merge into a MAP first (overrides win), then flatten to the `KEY=value` list libuv wants.
+        -- Appending environ() then the overrides produced DUPLICATE keys (`KEY=a` and `KEY=b`) — execve
+        -- then picks one platform-dependently, so an override could silently not take effect.
+        local merged = vim.tbl_extend("force", vim.fn.environ(), opts.env)
         env = {}
-        for k, v in pairs(vim.fn.environ()) do
-            env[#env + 1] = k .. "=" .. v
-        end
-        for k, v in pairs(opts.env) do
+        for k, v in pairs(merged) do
             env[#env + 1] = k .. "=" .. tostring(v)
         end
     end
@@ -208,7 +225,8 @@ end
 ---@param max_retries integer
 ---@param cbs lvim-dap.transport.Callbacks
 ---@param proc? uv.uv_process_t  a server process we spawned and now own
-local function tcp_connect(host, port, max_retries, cbs, proc)
+---@param extra? uv.uv_handle_t[]  the server process's stdout/stderr pipes, closed on teardown
+local function tcp_connect(host, port, max_retries, cbs, proc, extra)
     local attempt = 0
     local function try()
         attempt = attempt + 1
@@ -236,8 +254,9 @@ local function tcp_connect(host, port, max_retries, cbs, proc)
             end
             log.info("transport: connected", host, port)
             pump(sock, cbs)
-            -- The client owns the socket for writes; the process (if any) for teardown.
-            local client = make_client(sock, proc)
+            -- The client owns the socket for writes; the process (if any) + its stdout/stderr pipes for
+            -- teardown — otherwise those pipes stay read_start'd and open until VimLeave (leaked per run).
+            local client = make_client(sock, proc, extra)
             cbs.on_ready(nil)
             if cbs.on_client then
                 cbs.on_client(client)
@@ -273,7 +292,7 @@ function M.server(adapter, cbs)
         return
     end
 
-    local proc
+    local proc, extra
     if adapter.executable then
         local exe = substitute_port(adapter.executable, resolved_port)
         -- Spawn the server; its own stdout is not the DAP channel (the socket is), so we only
@@ -289,10 +308,19 @@ function M.server(adapter, cbs)
             log.info("transport: server process exited, code:", code)
         end)
         if not h then
+            -- Close the just-allocated pipes so a failed spawn does not leak two handles.
+            if stdout then
+                stdout:close()
+            end
+            if stderr then
+                stderr:close()
+            end
             cbs.on_ready(("failed to spawn server `%s`: %s"):format(exe.command, tostring(pid)))
             return
         end
         proc = h
+        -- Hand the pipes to the client for teardown (make_client read_stops + closes `extra`).
+        extra = { stdout, stderr }
         log.info("transport: spawned server", exe.command, "pid", pid, "port", resolved_port)
         if stdout then
             stdout:read_start(function() end)
@@ -306,7 +334,7 @@ function M.server(adapter, cbs)
         end
     end
 
-    tcp_connect(host, resolved_port, max_retries, cbs, proc)
+    tcp_connect(host, resolved_port, max_retries, cbs, proc, extra)
 end
 
 --- pipe transport: connect to a named pipe / unix socket (optionally spawning `executable`).

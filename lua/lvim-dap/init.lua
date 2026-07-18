@@ -31,6 +31,21 @@ local ok_hl, highlight = pcall(require, "lvim-utils.highlight")
 
 local M = {}
 
+--- Deep-merge `src` into `dst` IN PLACE — maps recurse, lists/scalars replace wholesale. A local
+--- stand-in for `lvim-utils.utils.merge`, used only on the setup fallback path when lvim-utils is
+--- absent, so the live `config` table is mutated (never rebound) and every reader sees the overrides.
+---@param dst table
+---@param src table
+local function merge_in_place(dst, src)
+    for k, v in pairs(src) do
+        if type(v) == "table" and type(dst[k]) == "table" and not vim.islist(v) then
+            merge_in_place(dst[k], v)
+        else
+            dst[k] = v
+        end
+    end
+end
+
 --- Active sessions keyed by id (root sessions; children hang off `session.children`).
 ---@type table<integer, lvim-dap.Session>
 local sessions = {}
@@ -143,6 +158,22 @@ local function define_signs()
     end
 end
 
+--- The first NORMAL code window in the current tabpage: not a float (`relative == ""`) and holding
+--- an ordinary buffer (`buftype == ""`). The `buftype` test is the root-cause seam — it rejects
+--- EVERY panel/terminal/prompt/help window generically, without a hard-coded filetype list, so the
+--- stopped-frame jump never loads the source INTO a debugger dock, a tree, a terminal, or any float.
+---@return integer?
+local function first_code_win()
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        local ok_cfg, cfg = pcall(vim.api.nvim_win_get_config, win)
+        local buf = vim.api.nvim_win_get_buf(win)
+        if ok_cfg and cfg.relative == "" and vim.bo[buf].buftype == "" then
+            return win
+        end
+    end
+    return nil
+end
+
 --- Place the stopped-line sign at a frame's source location and move the cursor there.
 ---@param s lvim-dap.Session
 local function jump_to_frame(s)
@@ -155,10 +186,11 @@ local function jump_to_frame(s)
     local bufnr = vim.fn.bufadd(path)
     vim.fn.bufload(bufnr)
     pcall(vim.fn.sign_place, 0, "lvim-dap-stopped", STOPPED_SIGN, bufnr, { lnum = frame.line, priority = 22 })
-    -- Move a window to the location (reuse a window showing the buffer, else the current one).
+    -- Reuse a window already showing the buffer; else load it into a normal code window (never a
+    -- float/panel/terminal — see first_code_win); only if none exists, fall back to the current one.
     local win = vim.fn.bufwinid(bufnr)
     if win == -1 then
-        win = vim.api.nvim_get_current_win()
+        win = first_code_win() or vim.api.nvim_get_current_win()
         vim.api.nvim_win_set_buf(win, bufnr)
     end
     pcall(vim.api.nvim_win_set_cursor, win, { frame.line, math.max((frame.column or 1) - 1, 0) })
@@ -176,7 +208,10 @@ end
 --- program's last output, which with `runInTerminal` never reaches the Console panel).
 ---@param s lvim-dap.Session
 local function close_terminal(s)
-    local buf = s and s.term_buf
+    if not s then
+        return
+    end
+    local buf = s.term_buf
     s.term_buf = nil
     if not buf or config.terminal.close_on_exit == false then
         return
@@ -201,11 +236,39 @@ end
 local function handle_run_in_terminal(s, request)
     local args = request.arguments or {}
     local cmd = args.args or {}
-    -- Open a terminal running the command; termopen gives us the job, jobpid the OS pid.
+
+    -- External terminal: when `config.terminal.command` is set (e.g. "alacritty -e"), run the
+    -- debuggee in the user's OWN terminal emulator instead of an integrated split — the emulator is
+    -- spawned detached with `<template> <cmd>`. A detached emulator hides the debuggee's real PID from
+    -- us, so no `processId` is reported (best-effort, which the DAP allows for the external kind).
+    if config.terminal.command and config.terminal.command ~= "" then
+        local argv = vim.list_extend(vim.split(config.terminal.command, " ", { trimempty = true }), cmd)
+        local ok_job, job = pcall(vim.fn.jobstart, argv, { cwd = args.cwd, env = args.env, detach = true })
+        local started = ok_job and type(job) == "number" and job > 0
+        s:respond(request, {}, started, started and nil or "failed to start external terminal")
+        return
+    end
+
+    -- Integrated terminal: open a split we own and run the command in a terminal buffer.
+    -- `jobstart(cmd, { term = true })` is the non-deprecated form of termopen; it THROWS on an invalid
+    -- argv (an empty `args.args`, ENOENT), so pcall it and, on any failure, tear the just-created split
+    -- down rather than leaving a dead empty terminal behind for the rest of the session.
     local prev = vim.api.nvim_get_current_win()
     vim.cmd(config.terminal.position .. " new")
+    local term_win = vim.api.nvim_get_current_win()
     local term_buf = vim.api.nvim_get_current_buf()
-    local job = vim.fn.termopen(cmd, { cwd = args.cwd, env = args.env })
+    local ok_job, job = pcall(vim.fn.jobstart, cmd, { cwd = args.cwd, env = args.env, term = true })
+    local pid = (ok_job and type(job) == "number" and job > 0) and vim.fn.jobpid(job) or nil
+    if not pid then
+        s.term_buf = nil
+        pcall(vim.api.nvim_win_close, term_win, true)
+        pcall(vim.api.nvim_buf_delete, term_buf, { force = true })
+        if vim.api.nvim_win_is_valid(prev) then
+            vim.api.nvim_set_current_win(prev)
+        end
+        s:respond(request, nil, false, "failed to start terminal")
+        return
+    end
     s.term_buf = term_buf
     -- The terminal dies WITH the session that spawned it. `Session:close()` is the single funnel every
     -- ending path runs through (a `terminated` event, an explicit terminate/disconnect, a dead adapter),
@@ -217,8 +280,7 @@ local function handle_run_in_terminal(s, request)
         end)
     end
     vim.api.nvim_set_current_win(prev)
-    local pid = job > 0 and vim.fn.jobpid(job) or nil
-    s:respond(request, { processId = pid }, pid ~= nil, pid and nil or "failed to start terminal")
+    s:respond(request, { processId = pid }, true)
 end
 
 --- Answer `startDebugging`: launch a CHILD session sharing the parent's adapter.
@@ -323,18 +385,18 @@ local function broadcast_breakpoints(bufnr, s)
     local targets = s and { s } or vim.tbl_values(sessions)
     for _, sess in ipairs(targets) do
         if not sess.closed then
-            async.run(function()
-                sess:set_breakpoints(path, bps, function(_, body)
-                    -- Reflect the adapter's verified verdict per returned breakpoint.
-                    if body and body.breakpoints then
-                        for i, rbp in ipairs(body.breakpoints) do
-                            local src = bps[i]
-                            if src then
-                                breakpoints.set_verified(path, src.line, rbp.verified ~= false, rbp.message)
-                            end
+            -- Callback-style: `set_breakpoints` never yields when an `on_result` is given, so no
+            -- coroutine is needed (an `async.run` here would only imply an await that never happens).
+            sess:set_breakpoints(path, bps, function(_, body)
+                -- Reflect the adapter's verified verdict per returned breakpoint.
+                if body and body.breakpoints then
+                    for i, rbp in ipairs(body.breakpoints) do
+                        local src = bps[i]
+                        if src then
+                            breakpoints.set_verified(path, src.line, rbp.verified ~= false, rbp.message)
                         end
                     end
-                end)
+                end
             end)
         end
     end
@@ -613,12 +675,19 @@ function M.set_breakpoint(condition, hit_condition, log_message)
 end
 
 --- Clear all breakpoints (in the current buffer, or everywhere with `all`).
+--- With `all`, EVERY buffer that had breakpoints must be re-broadcast (empty) to every live session,
+--- not just the current one — otherwise a cleared file's breakpoints stay armed inside the adapter and
+--- the debuggee keeps stopping at now-invisible lines.
 ---@param all? boolean
 function M.clear_breakpoints(all)
-    local bufnr = vim.api.nvim_get_current_buf()
-    breakpoints.clear(all and nil or bufnr)
-    for _, s in pairs(sessions) do
-        broadcast_breakpoints(bufnr, s)
+    local affected = all and vim.tbl_keys(breakpoints.get()) or { vim.api.nvim_get_current_buf() }
+    if all then
+        breakpoints.clear(nil) -- every buffer (NB: `all and nil or x` would wrongly pick x)
+    else
+        breakpoints.clear(affected[1])
+    end
+    for _, b in ipairs(affected) do
+        broadcast_breakpoints(b)
     end
 end
 
@@ -681,15 +750,22 @@ function M.run_to_cursor()
     local temp = { { line = lnum } }
     async.run(function()
         s:set_breakpoints(path, temp)
+        -- Restore the real breakpoints on the NEXT stop or terminate — but also on the session's own
+        -- close funnel: if the adapter process dies without ever emitting a `terminated` event, the two
+        -- event listeners would never fire and would stay registered globally, leaking stale closures
+        -- that the NEXT session's first stop then runs against this dead session. `Session:close()`
+        -- pcall-runs on_close hooks, so it is the designed seam that catches every ending path.
         local restore = function()
             listeners.before.event_stopped["lvim-dap.run_to_cursor"] = nil
             listeners.before.event_terminated["lvim-dap.run_to_cursor"] = nil
-            async.run(function()
+            s.on_close["lvim-dap.run_to_cursor"] = nil
+            if not s.closed then
                 s:set_breakpoints(path, saved)
-            end)
+            end
         end
         listeners.before.event_stopped["lvim-dap.run_to_cursor"] = restore
         listeners.before.event_terminated["lvim-dap.run_to_cursor"] = restore
+        s.on_close["lvim-dap.run_to_cursor"] = restore
         s:step("continue")
     end)
 end
@@ -756,9 +832,9 @@ function M.set_variable(container_ref, name, value, on_done)
     if not s then
         return
     end
-    async.run(function()
-        s:request("setVariable", { variablesReference = container_ref, name = name, value = value }, on_done)
-    end)
+    -- Callback-style request (an `on_done` is passed / the reply is fire-and-forget), so it does not
+    -- yield — no coroutine wrapper needed.
+    s:request("setVariable", { variablesReference = container_ref, name = name, value = value }, on_done)
 end
 
 --- Terminate the focused session (or all, per opts).
@@ -940,7 +1016,12 @@ function M.setup(opts)
     if ok_utils and utils.merge then
         utils.merge(config, opts or {})
     else
-        config = vim.tbl_deep_extend("force", config, opts or {})
+        -- Fallback merge when lvim-utils is absent: it MUST write into the existing `config` table in
+        -- place (same semantics as lvim-utils.utils.merge — recurse maps, replace lists/scalars).
+        -- Rebinding the local (`config = vim.tbl_deep_extend(...)`) would leave every OTHER module —
+        -- breakpoints, session, the earlier upvalue captures — reading the original, un-merged table,
+        -- so e.g. `persist.breakpoints` would silently stay false.
+        merge_in_place(config, opts or {})
     end
     log.set_level(config.log_level)
 
@@ -961,6 +1042,7 @@ function M.setup(opts)
     define_signs()
     setup_command()
     ensure_wired()
+    breakpoints.setup_lifecycle()
     breakpoints.setup_persistence()
 
     -- Best-effort clean shutdown of live sessions on exit.
