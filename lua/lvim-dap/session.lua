@@ -44,6 +44,7 @@ local log = require("lvim-dap.log")
 ---@field initialized boolean
 ---@field closed boolean
 ---@field threads table<integer, lvim-dap.Thread>
+---@field run_gen integer
 ---@field stopped_thread_id integer?
 ---@field current_frame lvim-dap.StackFrame?
 ---@field filetype string
@@ -99,6 +100,7 @@ function Session.new(adapter, config, opts)
         message_callbacks = {}, -- request seq → reply callback
         handlers = {},
         threads = {},
+        run_gen = 0, -- bumped on continue/step/stop; stale event_stopped fetches bail against it
         stopped_thread_id = nil,
         current_frame = nil,
         filetype = (opts and opts.filetype) or vim.bo.filetype,
@@ -260,6 +262,13 @@ end
 ---@param message string?
 function Session:respond(request, body, success, message)
     self.seq = self.seq + 1
+    -- An empty Lua table encodes to JSON `[]` (array), but a DAP response `body` must be an object —
+    -- e.g. RunInTerminalResponse's body is a required object, and strict adapters (js-debug) reject a
+    -- `[]` body → the debuggee never starts. Normalise a plain empty table to an empty DICT here, at
+    -- the seam, so no caller can reintroduce the pitfall (mirrors what `request()` does for arguments).
+    if type(body) == "table" and next(body) == nil and not getmetatable(body) then
+        body = vim.empty_dict()
+    end
     local payload = {
         seq = self.seq,
         type = "response",
@@ -402,8 +411,18 @@ end
 --- stack, focus the top frame, and pre-fetch its scopes. The view repaints from `after`.
 ---@param stopped table  dap.StoppedEvent body
 function Session:event_stopped(stopped)
+    -- The fetch below (threads → stackTrace → scopes) AWAITS. If a `continued` event or a user `step`
+    -- lands during those awaits the program has RESUMED — but this in-flight coroutine would still
+    -- re-assert stopped state (set current_frame, dispatch frame_updated) and the editor would jump to
+    -- a stale frame while the debuggee runs. Capture a run generation and bail after every await once
+    -- it has moved on (continue/step/a newer stop each bump it) — no timers, no locks, just the counter.
+    self.run_gen = self.run_gen + 1
+    local gen = self.run_gen
     async.run(function()
         self:update_threads()
+        if self.run_gen ~= gen then
+            return
+        end
         -- Per DAP a `stopped` event MAY omit `threadId` when `allThreadsStopped` is set (some gdb/lldb
         -- `pause` configurations stop-all without one). Falling through with a nil thread left the UI on
         -- "running" and never jumped the editor. Pick the lowest known thread id so the normal fetch/jump
@@ -421,6 +440,9 @@ function Session:event_stopped(stopped)
             return
         end
         local frames = self:fetch_stack(tid)
+        if self.run_gen ~= gen then
+            return
+        end
         local thread = self.threads[tid]
         if thread then
             thread.stopped = true
@@ -430,6 +452,9 @@ function Session:event_stopped(stopped)
         if top then
             self.current_frame = top
             self:fetch_scopes(top)
+            if self.run_gen ~= gen then
+                return
+            end
         end
         -- Frame + scopes are now populated (unlike the raw `stopped` event, which fires before
         -- the async fetch). The engine jumps the editor and the view repaints off THIS hook.
@@ -505,6 +530,8 @@ function Session:event_continued(event)
     if self.stopped_thread_id == event.threadId or event.allThreadsContinued ~= false then
         self.stopped_thread_id = nil
         self.current_frame = nil
+        -- Invalidate any in-flight event_stopped fetch (see run_gen there): the program has resumed.
+        self.run_gen = self.run_gen + 1
     end
 end
 
@@ -554,9 +581,11 @@ function Session:step(step, params)
         log.warn("session", self.id, "step", step, "with no stopped thread")
     end
     local args = vim.tbl_extend("keep", params or {}, { threadId = thread_id })
-    -- Optimistically clear stopped state; a subsequent stopped event re-sets it.
+    -- Optimistically clear stopped state; a subsequent stopped event re-sets it. Bump the run
+    -- generation so a still-in-flight event_stopped fetch (from the stop we are leaving) bails.
     self.stopped_thread_id = nil
     self.current_frame = nil
+    self.run_gen = self.run_gen + 1
     self:request(step, args, function(err)
         if err then
             log.warn("session", self.id, step, "error:", err.message)

@@ -11,6 +11,8 @@
 --
 ---@module "lvim-dap.listeners"
 
+local log = require("lvim-dap.log")
+
 --- Auto-vivifying map: reading any event/request key yields a fresh owner→handler table.
 ---@return table
 local function autoviv()
@@ -43,8 +45,14 @@ function M.dispatch(phase, name, ...)
     if not bucket then
         return
     end
-    for _, handler in pairs(bucket) do
-        pcall(handler, ...)
+    for owner, handler in pairs(bucket) do
+        -- A broken view/user hook must not take the dispatch down (pcall), but its error must not vanish
+        -- either — surface it to the log with the owner + which hook, so a silently-dead subscriber is
+        -- diagnosable instead of just "the panel stopped updating".
+        local ok, err = pcall(handler, ...)
+        if not ok then
+            log.error("listeners:", phase .. "." .. name, "handler", tostring(owner), "failed:", err)
+        end
     end
 end
 

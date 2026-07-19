@@ -136,6 +136,10 @@ function M.use(name, opts)
         end
     elseif vim.is_callable(mod) then
         mod(opts)
+    else
+        -- A module returning e.g. `true` or a string loads fine but is not a preset: it registers
+        -- nothing. Reject it (rather than reporting a successful `use` that did nothing).
+        return false, "module `" .. modname .. "` is not a preset (a table or callable is expected)"
     end
     for atype in pairs(M.adapters) do
         if not before[atype] then

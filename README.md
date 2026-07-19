@@ -20,7 +20,8 @@ port over unchanged.
 - **Three transports** — executable (stdio), server (TCP, incl. `${port}` free-port allocation and
   spawned-server + connect retries), and pipe.
 - **Breakpoints** — line, conditional, hit-condition, and logpoints (extmark-anchored, so they
-  track edits), plus exception filters and function breakpoints. Optional per-project persistence.
+  track edits and survive buffer unload/`:bd` within the session), plus exception filters. Optional
+  per-project persistence across restarts.
 - **Full inspection** — threads → stack frames → scopes → variables (lazy), `evaluate` in
   repl/hover/watch contexts, `setVariable`, run-to-cursor, stepping (incl. reverse where supported).
 - **Multi-session** — `startDebugging` child sessions and `runInTerminal`, with a focused-session

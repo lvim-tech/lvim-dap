@@ -46,6 +46,13 @@ local function strip_jsonc(s)
     local out = {}
     local i, n = 1, #s
     local in_str, esc = false, false
+    -- Index in `out` of a comma awaiting a possible trailing-drop. Trailing-comma removal is done HERE,
+    -- inside the string-aware scan — NOT as a final gsub over the whole text, which would also match a
+    -- comma inside a STRING literal (e.g. `"delims": "a, ]"`) and silently corrupt the value. When the
+    -- next non-whitespace, non-comment char outside a string is `]`/`}` we blank the pending comma; any
+    -- other value char (including the opening quote of a next string) clears it as a real separator.
+    ---@type integer?
+    local pending_comma = nil
     while i <= n do
         local c = s:sub(i, i)
         if in_str then
@@ -59,6 +66,7 @@ local function strip_jsonc(s)
             end
             i = i + 1
         elseif c == '"' then
+            pending_comma = nil
             in_str = true
             out[#out + 1] = c
             i = i + 1
@@ -68,13 +76,23 @@ local function strip_jsonc(s)
         elseif c == "/" and s:sub(i + 1, i + 1) == "*" then
             local close = s:find("*/", i + 2, true)
             i = close and (close + 2) or (n + 1)
+        elseif c == "," then
+            out[#out + 1] = c
+            pending_comma = #out
+            i = i + 1
+        elseif c:match("%s") then
+            out[#out + 1] = c
+            i = i + 1
         else
+            if pending_comma and (c == "]" or c == "}") then
+                out[pending_comma] = ""
+            end
+            pending_comma = nil
             out[#out + 1] = c
             i = i + 1
         end
     end
-    -- Drop trailing commas before a closing } or ].
-    return (table.concat(out):gsub(",(%s*[%]}])", "%1"))
+    return table.concat(out)
 end
 
 --- Parse a launch.json string into a list of configurations.

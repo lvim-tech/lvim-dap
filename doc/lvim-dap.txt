@@ -142,8 +142,12 @@ set_exception_breakpoints({filters}[, {opts}])   *lvim-dap.set_exception_breakpo
 run_to_cursor()                                          *lvim-dap.run_to_cursor*
     Continue to the cursor line (temporary breakpoint), while stopped.
 
-With `persist.breakpoints = true`, breakpoints are stored per project root and
-restored on BufReadPost.
+Breakpoints survive buffer unload (`:bd` + reopen) within the Neovim session:
+they are snapshotted by path on BufUnload and re-placed on reopen, independent
+of on-disk persistence.
+
+With `persist.breakpoints = true`, breakpoints are also stored per project root
+and restored on BufReadPost across Neovim restarts.
 
 ==============================================================================
 7. COMMANDS                                                    *lvim-dap-commands*

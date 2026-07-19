@@ -46,9 +46,17 @@ local function merge_in_place(dst, src)
     end
 end
 
---- Active sessions keyed by id (root sessions; children hang off `session.children`).
+--- Root sessions keyed by id (the view's session tree; children hang off `session.children`).
 ---@type table<integer, lvim-dap.Session>
 local sessions = {}
+
+--- EVERY live session (roots AND startDebugging children), keyed by id. A child (js-debug's real
+--- debugger) is not in `sessions`, so global operations that only walked `sessions` skipped it: a
+--- breakpoint toggled mid-run never reached the child, `terminate({all})`/VimLeavePre left its
+--- socket open, and `first_stopped` could not find a stopped child. This flat registry is the single
+--- list every such operation iterates; `sessions` stays roots-only for the tree view.
+---@type table<integer, lvim-dap.Session>
+local all_sessions = {}
 
 --- The focused session (drives step/continue/eval when several run).
 ---@type lvim-dap.Session?
@@ -184,7 +192,13 @@ local function jump_to_frame(s)
     vim.fn.sign_unplace("lvim-dap-stopped")
     local path = frame.source.path
     local bufnr = vim.fn.bufadd(path)
-    vim.fn.bufload(bufnr)
+    -- `bufload` can THROW (a stale swap file → E325/ATTENTION aborted, or other load failures); this
+    -- runs inside the scheduled frame_updated listener, so an unguarded throw would surface as an
+    -- autocmd error and skip the sign/cursor logic. A load failure means there is nothing to jump to.
+    local loaded = pcall(vim.fn.bufload, bufnr)
+    if not loaded or not vim.api.nvim_buf_is_loaded(bufnr) then
+        return
+    end
     pcall(vim.fn.sign_place, 0, "lvim-dap-stopped", STOPPED_SIGN, bufnr, { lnum = frame.line, priority = 22 })
     -- Reuse a window already showing the buffer; else load it into a normal code window (never a
     -- float/panel/terminal — see first_code_win); only if none exists, fall back to the current one.
@@ -288,8 +302,13 @@ end
 ---@param request table
 local function handle_start_debugging(s, request)
     local args = request.arguments or {}
-    local child_config = vim.tbl_extend("force", vim.deepcopy(s.config), args.configuration or {})
-    child_config.request = args.request or child_config.request
+    -- The child configuration IS `arguments.configuration` (+ `arguments.request`) — the adapter sends
+    -- it complete. Merging the PARENT config underneath (as before) leaks parent-only keys (`program`,
+    -- `stopOnEntry`, `args`, `console`, …) into a child that is typically an `attach`, which adapters
+    -- that validate their config or branch on key presence then choke on. Take the child's own config.
+    local child_config = vim.deepcopy(args.configuration or {})
+    child_config.request = args.request or child_config.request or "attach"
+    child_config.name = child_config.name or ((s.config.name or "debug") .. " (child)")
     s:respond(request, nil, true)
     M.run(child_config, { parent = s, adapter = s.adapter })
 end
@@ -331,12 +350,12 @@ local function first_stopped()
     if session and session.stopped_thread_id then
         return session
     end
-    for _, s in pairs(sessions) do
+    for _, s in pairs(all_sessions) do
         if s.stopped_thread_id then
             return s
         end
     end
-    return session or select(2, next(sessions))
+    return session or select(2, next(all_sessions))
 end
 
 --- Register the on-close reset + the frame-jump listener once.
@@ -356,14 +375,24 @@ local function ensure_wired()
     listeners.after.event_terminated["lvim-dap.sign"] = function()
         vim.schedule(clear_stopped_sign)
     end
-    -- Adapter `breakpoint` events carry verified/rejected state → reflect it in the gutter.
+    -- Adapter `breakpoint` events carry verified/rejected state → reflect it in the gutter. Resolve the
+    -- mark by the adapter's breakpoint `id` FIRST (recorded from the setBreakpoints response): an
+    -- adapter commonly MOVES a breakpoint to the next executable line and reports that moved line here,
+    -- which has no mark, so matching by line alone would silently drop the update. Fall back to the line
+    -- for adapters that omit ids.
     listeners.after.event_breakpoint["lvim-dap.verify"] = function(_, body)
         local bp = body and body.breakpoint
-        if bp and bp.source and bp.source.path and bp.line then
-            vim.schedule(function()
-                breakpoints.set_verified(bp.source.path, bp.line, bp.verified ~= false, bp.message)
-            end)
+        if not bp then
+            return
         end
+        vim.schedule(function()
+            if bp.id and breakpoints.set_verified_by_id(bp.id, bp.verified ~= false, bp.message) then
+                return
+            end
+            if bp.source and bp.source.path and bp.line then
+                breakpoints.set_verified(bp.source.path, bp.line, bp.verified ~= false, bp.message)
+            end
+        end)
     end
 end
 
@@ -382,7 +411,9 @@ local function broadcast_breakpoints(bufnr, s)
         return
     end
     local bps = breakpoints.get_buffer(bufnr)
-    local targets = s and { s } or vim.tbl_values(sessions)
+    -- Target EVERY live session (children included) so a mid-run toggle reaches js-debug's child, which
+    -- is the session actually debugging the program — walking only roots left it armed with the old set.
+    local targets = s and { s } or vim.tbl_values(all_sessions)
     for _, sess in ipairs(targets) do
         if not sess.closed then
             -- Callback-style: `set_breakpoints` never yields when an `on_result` is given, so no
@@ -393,7 +424,9 @@ local function broadcast_breakpoints(bufnr, s)
                     for i, rbp in ipairs(body.breakpoints) do
                         local src = bps[i]
                         if src then
-                            breakpoints.set_verified(path, src.line, rbp.verified ~= false, rbp.message)
+                            -- Record the adapter's breakpoint id so a later `breakpoint` EVENT for a
+                            -- MOVED line matches back by id (see the event_breakpoint listener).
+                            breakpoints.set_verified(path, src.line, rbp.verified ~= false, rbp.message, rbp.id)
                         end
                     end
                 end
@@ -412,7 +445,7 @@ local function push_all_breakpoints(s)
                 if body and body.breakpoints then
                     for i, rbp in ipairs(body.breakpoints) do
                         if bps[i] then
-                            breakpoints.set_verified(path, bps[i].line, rbp.verified ~= false, rbp.message)
+                            breakpoints.set_verified(path, bps[i].line, rbp.verified ~= false, rbp.message, rbp.id)
                         end
                     end
                 end
@@ -455,6 +488,7 @@ local function launch(adapter, resolved_config, opts)
             vim.notify("lvim-dap: " .. tostring(err), vim.log.levels.ERROR)
             return
         end
+        all_sessions[s.id] = s
         wire_reverse(s)
         -- On the `initialized` event: push every user breakpoint (per source) + the selected
         -- exception filters, THEN the session finishes configuration (configurationDone).
@@ -464,6 +498,11 @@ local function launch(adapter, resolved_config, opts)
         end
         s.on_close["lvim-dap.reset"] = function(closed)
             sessions[closed.id] = nil
+            all_sessions[closed.id] = nil
+            -- Detach a closed child from its parent's tree so dead sessions don't accumulate there.
+            if closed.parent then
+                closed.parent.children[closed.id] = nil
+            end
             if session and session.id == closed.id then
                 M.set_session(nil)
             end
@@ -485,7 +524,12 @@ function M.run(config_in, opts)
     assert(type(config_in) == "table", "lvim-dap.run: config must be a table")
     opts = opts or {}
     opts.filetype = opts.filetype or vim.bo.filetype
-    last_run = { config = config_in, opts = opts }
+    -- Only ROOT runs are replayable by run_last. A startDebugging CHILD run carries a live parent
+    -- Session (`opts.parent`) + its resolved adapter table (`opts.adapter`) — replaying that later
+    -- would re-run the child config against a DEAD parent and bypass the registry. Never record it.
+    if not opts.parent then
+        last_run = { config = config_in, opts = opts }
+    end
     ensure_wired()
 
     async.run(function()
@@ -711,8 +755,12 @@ end
 ---@param options? table[]
 function M.set_exception_breakpoints(filters, options)
     exception_filters = filters
-    if session then
-        session:set_exception_breakpoints(filters, options)
+    -- Apply to EVERY live session (children included), not just the focused one — otherwise the other
+    -- concurrent/child sessions keep the old exception behaviour, diverging from the UI's checkbox state.
+    for _, s in pairs(all_sessions) do
+        if not s.closed then
+            s:set_exception_breakpoints(filters, options)
+        end
     end
 end
 
@@ -842,12 +890,14 @@ end
 function M.terminate(opts)
     opts = opts or {}
     if opts.all then
-        for _, s in pairs(sessions) do
+        -- Every live session, children included — each child owns its own transport connection, so
+        -- terminating only roots left js-debug's child process running after "terminate all".
+        for _, s in pairs(all_sessions) do
             s:terminate()
         end
         return
     end
-    local s = session or select(2, next(sessions))
+    local s = session or select(2, next(all_sessions))
     if s then
         s:terminate(opts)
     else
@@ -884,9 +934,18 @@ function M.evaluate(expression, context, on_result)
         vim.notify("lvim-dap: no active session to evaluate in", vim.log.levels.INFO)
         return
     end
-    async.run(function()
-        s:evaluate(expression, context, on_result)
-    end)
+    -- With no callback the previous code awaited inside a coroutine and DISCARDED `err, body` — the
+    -- call did nothing observable. Default a callback that reports the result (repl semantics); a
+    -- callback-style evaluate does not yield, so no coroutine wrapper is needed.
+    local cb = on_result
+        or function(err, body)
+            if err then
+                vim.notify("lvim-dap: " .. tostring(err.message), vim.log.levels.WARN)
+            elseif body then
+                vim.notify(("%s = %s"):format(expression, body.result or ""), vim.log.levels.INFO)
+            end
+        end
+    s:evaluate(expression, context, cb)
 end
 
 --- The focused session.
@@ -1049,7 +1108,8 @@ function M.setup(opts)
     vim.api.nvim_create_autocmd("VimLeavePre", {
         group = vim.api.nvim_create_augroup("lvim-dap.exit", { clear = true }),
         callback = function()
-            for _, s in pairs(sessions) do
+            -- Close EVERY live session (children own their own connections too) so nothing survives quit.
+            for _, s in pairs(all_sessions) do
                 pcall(function()
                     s:close()
                 end)

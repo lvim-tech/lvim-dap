@@ -83,11 +83,20 @@ local function pump(stream, cbs)
             return
         end
         finished = true
+        -- `read_stop` is a uv API — safe to call synchronously in this fast event context. But
+        -- `on_exit` runs the WHOLE `Session:close()` (fail pending requests, fire on_close hooks:
+        -- clear the stopped sign, notify the view of "no session"), which touches `vim.fn.*` / the
+        -- editor API and would throw E5560 here (a luv read callback is `vim.in_fast_event()`). This
+        -- is the NORMAL adapter-death path (a `kill -9`d debugpy), so deliver the exit on the main
+        -- loop; the `finished` guard keeps it once-only and `Session.launch`'s on_exit guards the
+        -- scheduled process-exit double-fire on `self.closed`.
         pcall(function()
             stream:read_stop()
         end)
         if cbs.on_exit then
-            cbs.on_exit()
+            vim.schedule(function()
+                cbs.on_exit()
+            end)
         end
     end
     stream:read_start(rpc.create_read_loop(cbs.on_body, finish, function(msg)
@@ -241,6 +250,12 @@ local function tcp_connect(host, port, max_retries, cbs, proc, extra)
             return
         end
         sock:connect(host, port, function(err)
+            -- This connect callback runs in a fast event context (a luv callback). Both branches
+            -- deliver into the engine — `on_ready(err)` reaches an UNprotected `vim.notify` (a luv
+            -- callback-error dump instead of the connect error), and the success tail runs the whole
+            -- session wiring including `set_session` → `on_session` listeners (the view opening its
+            -- windows = API calls, pcall'd → silently skipped). Deliver both on the main loop.
+            -- Scheduling `pump` alongside loses no bytes — data buffers in the socket until read_start.
             if err then
                 pcall(function()
                     sock:close()
@@ -248,19 +263,23 @@ local function tcp_connect(host, port, max_retries, cbs, proc, extra)
                 if attempt <= max_retries then
                     vim.defer_fn(try, 250)
                 else
-                    cbs.on_ready(("couldn't connect to %s:%s: %s"):format(host, port, err))
+                    vim.schedule(function()
+                        cbs.on_ready(("couldn't connect to %s:%s: %s"):format(host, port, err))
+                    end)
                 end
                 return
             end
             log.info("transport: connected", host, port)
-            pump(sock, cbs)
-            -- The client owns the socket for writes; the process (if any) + its stdout/stderr pipes for
-            -- teardown — otherwise those pipes stay read_start'd and open until VimLeave (leaked per run).
-            local client = make_client(sock, proc, extra)
-            cbs.on_ready(nil)
-            if cbs.on_client then
-                cbs.on_client(client)
-            end
+            vim.schedule(function()
+                pump(sock, cbs)
+                -- The client owns the socket for writes; the process (if any) + its stdout/stderr pipes
+                -- for teardown — otherwise those pipes stay read_start'd and open until VimLeave.
+                local client = make_client(sock, proc, extra)
+                cbs.on_ready(nil)
+                if cbs.on_client then
+                    cbs.on_client(client)
+                end
+            end)
         end)
     end
     try()
@@ -363,6 +382,9 @@ function M.pipe(adapter, cbs)
             return
         end
         sock:connect(pipe_path, function(err)
+            -- Fast event context (a luv callback) — deliver into the engine on the main loop, exactly
+            -- as tcp_connect does: an UNprotected `vim.notify` on failure and the `on_session` view
+            -- wiring on success would otherwise throw / be silently skipped in fast context.
             if err then
                 pcall(function()
                     sock:close()
@@ -371,16 +393,20 @@ function M.pipe(adapter, cbs)
                 if elapsed < timeout then
                     vim.defer_fn(try, 100)
                 else
-                    cbs.on_ready(("couldn't connect to pipe %s: %s"):format(pipe_path, err))
+                    vim.schedule(function()
+                        cbs.on_ready(("couldn't connect to pipe %s: %s"):format(pipe_path, err))
+                    end)
                 end
                 return
             end
-            pump(sock, cbs)
-            local client = make_client(sock, proc)
-            cbs.on_ready(nil)
-            if cbs.on_client then
-                cbs.on_client(client)
-            end
+            vim.schedule(function()
+                pump(sock, cbs)
+                local client = make_client(sock, proc)
+                cbs.on_ready(nil)
+                if cbs.on_client then
+                    cbs.on_client(client)
+                end
+            end)
         end)
     end
     try()

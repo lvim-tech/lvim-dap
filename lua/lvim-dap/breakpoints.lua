@@ -26,9 +26,19 @@ local M = {}
 ---@type integer  extmark namespace for breakpoints (signs ride on the marks)
 local ns = vim.api.nvim_create_namespace("lvim-dap-breakpoints")
 
---- Per-buffer metadata for marks that carry more than a line. bufnr → mark_id → meta.
----@type table<integer, table<integer, { condition?: string, hitCondition?: string, logMessage?: string, verified?: boolean, message?: string }>>
+--- Per-buffer metadata for marks that carry more than a line. bufnr → mark_id → meta. `dap_id` is
+--- the adapter's breakpoint id from the last setBreakpoints response — the seam a later `breakpoint`
+--- EVENT (which reports the adapter's possibly-MOVED line, not the user's) is matched back by.
+---@type table<integer, table<integer, { condition?: string, hitCondition?: string, logMessage?: string, verified?: boolean, message?: string, dap_id?: integer }>>
 local meta = {}
+
+--- In-memory breakpoint snapshots keyed by absolute PATH, taken on BufUnload. Extmarks die with the
+--- buffer's marktree, so `:bd` + reopen (same bufnr) would otherwise silently lose every breakpoint
+--- even with persistence OFF. This survives that within the Neovim session, independent of the json
+--- store. Kept after wipeout too (harmless — a wiped buffer never re-fires restore, and it lets
+--- `:bw` + reopen restore as well, matching nvim-dap's "breakpoints outlive the buffer" behaviour).
+---@type table<string, { line: integer, condition?: string, hitCondition?: string, logMessage?: string }[]>
+local unloaded = {}
 
 --- The project root markers used to key persisted breakpoints.
 local ROOT_MARKERS = { ".git", "pyproject.toml", "go.mod", "package.json", "Cargo.toml", "build.zig" }
@@ -82,18 +92,26 @@ local function sign_for(m)
     return "LvimDapBreakpoint"
 end
 
+--- Sign name → the `config.signs` field holding its glyph. Static (built once, not per placement);
+--- the glyph itself is read LIVE from `config.signs` so a runtime override still takes effect. The
+--- highlight group name equals the sign name for all four kinds.
+---@type table<string, string>
+local SIGN_GLYPH_KEY = {
+    LvimDapBreakpoint = "breakpoint",
+    LvimDapBreakpointCondition = "breakpoint_condition",
+    LvimDapBreakpointRejected = "breakpoint_rejected",
+    LvimDapLogPoint = "log_point",
+}
+
 --- Glyph + hl for a sign name, from the live config/highlight groups.
 ---@param sign_name string
 ---@return string glyph, string hl
 local function sign_style(sign_name)
-    local map = {
-        LvimDapBreakpoint = { config.signs.breakpoint, "LvimDapBreakpoint" },
-        LvimDapBreakpointCondition = { config.signs.breakpoint_condition, "LvimDapBreakpointCondition" },
-        LvimDapBreakpointRejected = { config.signs.breakpoint_rejected, "LvimDapBreakpointRejected" },
-        LvimDapLogPoint = { config.signs.log_point, "LvimDapLogPoint" },
-    }
-    local e = map[sign_name] or map.LvimDapBreakpoint
-    return e[1], e[2]
+    local key = SIGN_GLYPH_KEY[sign_name]
+    if not key then
+        return config.signs.breakpoint, "LvimDapBreakpoint"
+    end
+    return config.signs[key], sign_name
 end
 
 --- Place (or re-place) the extmark+sign for a breakpoint at a 1-based line.
@@ -308,13 +326,33 @@ function M.get()
     return result
 end
 
---- Update a breakpoint's verified state from an adapter `breakpoint` event / setBreakpoints
---- response (matched by line within a buffer path).
+--- Apply a verified/rejected verdict (+ optional adapter id) to one resolved mark and re-place it.
+---@param bufnr integer
+---@param mk { id: integer, line: integer }
+---@param verified boolean
+---@param message? string
+---@param dap_id? integer
+local function apply_verified(bufnr, mk, verified, message, dap_id)
+    meta[bufnr] = meta[bufnr] or {}
+    local m = meta[bufnr][mk.id] or {}
+    m.verified = verified
+    m.message = message
+    if dap_id ~= nil then
+        m.dap_id = dap_id
+    end
+    meta[bufnr][mk.id] = m
+    place(bufnr, mk.line, m, mk.id) -- re-place to update the sign (rejected glyph)
+end
+
+--- Update a breakpoint's verified state from a setBreakpoints RESPONSE, matched by the USER `line`
+--- (the mark is there on the response path). `dap_id` records the adapter's breakpoint id so a later
+--- `breakpoint` EVENT for a MOVED line can be matched back by id (see `set_verified_by_id`).
 ---@param path string
 ---@param line integer
 ---@param verified boolean
 ---@param message? string
-function M.set_verified(path, line, verified, message)
+---@param dap_id? integer
+function M.set_verified(path, line, verified, message, dap_id)
     local bufnr = vim.fn.bufnr(path)
     if bufnr == -1 then
         return
@@ -323,12 +361,32 @@ function M.set_verified(path, line, verified, message)
     if not mk then
         return
     end
-    meta[bufnr] = meta[bufnr] or {}
-    local m = meta[bufnr][mk.id] or {}
-    m.verified = verified
-    m.message = message
-    meta[bufnr][mk.id] = m
-    place(bufnr, line, m, mk.id) -- re-place to update the sign (rejected glyph)
+    apply_verified(bufnr, mk, verified, message, dap_id)
+end
+
+--- Update a breakpoint's verified state matched by the adapter's breakpoint `id` (the `breakpoint`
+--- EVENT path). Scans `meta` for the recorded `dap_id` — so an adapter that MOVED the breakpoint to
+--- another line, and reports that moved line in the event, still updates the right mark (matching by
+--- the event's line would find no mark and silently drop the update). Returns true when one matched.
+---@param dap_id integer
+---@param verified boolean
+---@param message? string
+---@return boolean
+function M.set_verified_by_id(dap_id, verified, message)
+    for bufnr, marks in pairs(meta) do
+        if vim.api.nvim_buf_is_valid(bufnr) then
+            for mark_id, m in pairs(marks) do
+                if m.dap_id == dap_id then
+                    local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns, mark_id, {})
+                    if pos and pos[1] then
+                        apply_verified(bufnr, { id = mark_id, line = pos[1] + 1 }, verified, message, dap_id)
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
 end
 
 --- Build a quickfix list of all breakpoints.
@@ -377,9 +435,14 @@ function M.restore_buffer(bufnr)
         return
     end
     for _, bp in ipairs(list) do
-        if not mark_at(bufnr, bp.line) then
+        -- Clamp BEFORE the dedupe check, not just inside place(): two persisted lines past a now-shorter
+        -- file's EOF (90 and 100 into a 50-line file) both dedupe-miss at their ORIGINAL lines, then both
+        -- place() clamps them onto line 50 → two marks on one line, duplicated on the wire. Dedupe at the
+        -- clamped target instead.
+        local target = math.min(bp.line, vim.api.nvim_buf_line_count(bufnr))
+        if target >= 1 and not mark_at(bufnr, target) then
             local m = { condition = bp.condition, hitCondition = bp.hitCondition, logMessage = bp.logMessage }
-            local id = place(bufnr, bp.line, m)
+            local id = place(bufnr, target, m)
             if id then
                 meta[bufnr] = meta[bufnr] or {}
                 meta[bufnr][id] = m
@@ -400,14 +463,80 @@ function M.persist_buffer(bufnr)
     end
 end
 
---- Install the buffer-lifecycle autocmd (idempotent). Called UNCONDITIONALLY from init.setup — it is
---- NOT gated on persistence. Extmarks die with their buffer, but the parallel `meta` table (condition/
---- log/verified state keyed by bufnr → mark id) does not. Neovim REUSES buffer numbers and restarts
---- extmark ids per namespace, so without this a new buffer that reuses a wiped buffer's number could
---- resolve a fresh mark id against the OLD buffer's metadata — a plain breakpoint silently inheriting a
---- stale condition (then pushed to the adapter). Dropping `meta[buf]` on BufWipeout closes that seam.
+--- Snapshot a buffer's breakpoints (marks + their meta) into `unloaded[path]` before its marktree
+--- dies, and drop the buffer's `meta` (extmarks are already gone / going). Named buffers only.
+---@param bufnr integer
+local function snapshot_unloaded(bufnr)
+    local name = vim.api.nvim_buf_get_name(bufnr)
+    if name ~= "" then
+        local marks = marks_in(bufnr)
+        if #marks > 0 then
+            local list = {}
+            for _, mk in ipairs(marks) do
+                local m = (meta[bufnr] or {})[mk.id] or {}
+                list[#list + 1] = {
+                    line = mk.line,
+                    condition = m.condition,
+                    hitCondition = m.hitCondition,
+                    logMessage = m.logMessage,
+                }
+            end
+            unloaded[vim.fs.normalize(name)] = list
+        end
+    end
+    meta[bufnr] = nil
+end
+
+--- Re-place breakpoints captured for this buffer's path on BufUnload (independent of the json store).
+---@param bufnr integer
+local function restore_unloaded(bufnr)
+    local name = vim.api.nvim_buf_get_name(bufnr)
+    if name == "" then
+        return
+    end
+    local key = vim.fs.normalize(name)
+    local list = unloaded[key]
+    if not list then
+        return
+    end
+    unloaded[key] = nil
+    for _, bp in ipairs(list) do
+        local target = math.min(bp.line, vim.api.nvim_buf_line_count(bufnr))
+        if target >= 1 and not mark_at(bufnr, target) then
+            local m = { condition = bp.condition, hitCondition = bp.hitCondition, logMessage = bp.logMessage }
+            local id = place(bufnr, target, m)
+            if id then
+                meta[bufnr] = meta[bufnr] or {}
+                meta[bufnr][id] = m
+            end
+        end
+    end
+end
+
+--- Install the buffer-lifecycle autocmds (idempotent). Called UNCONDITIONALLY from init.setup — NOT
+--- gated on persistence. Two jobs:
+---   • BufUnload snapshots breakpoints by PATH so `:bd` + reopen (same bufnr) does not silently lose
+---     them — extmarks die with the buffer's marktree, so without this the gutter just goes empty with
+---     no signal. BufReadPost restores from that snapshot. This works with persistence OFF.
+---   • Dropping `meta[buf]` (on unload AND wipeout) is also the leak/mis-attach fix: Neovim REUSES
+---     buffer numbers and restarts extmark ids per namespace, so a fresh mark id in a REUSED bufnr
+---     could otherwise resolve against the old buffer's metadata (a plain breakpoint silently
+---     inheriting a stale condition, then pushed to the adapter).
 function M.setup_lifecycle()
     local group = vim.api.nvim_create_augroup("lvim-dap.breakpoints.lifecycle", { clear = true })
+    vim.api.nvim_create_autocmd("BufUnload", {
+        group = group,
+        callback = function(ev)
+            snapshot_unloaded(ev.buf)
+        end,
+    })
+    vim.api.nvim_create_autocmd("BufReadPost", {
+        group = group,
+        callback = function(ev)
+            restore_unloaded(ev.buf)
+        end,
+    })
+    -- Wipeout of a buffer that was never unloaded first is rare but possible; clear its meta too.
     vim.api.nvim_create_autocmd("BufWipeout", {
         group = group,
         callback = function(ev)
