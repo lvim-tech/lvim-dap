@@ -137,7 +137,9 @@ adapters), `log` (open the log file).
 
 ## API
 
-Run control: `run(config, opts)`, `run_last()`, `continue(opts)`, `run_to_cursor()`, `restart`,
+Run control: `run(config, opts)`, `run_last()` (replays the last config run in this Neovim session —
+in-memory by design, since a config can hold a live session, an adapter table or a function-valued
+`program`, none of which survive storage), `continue(opts)`, `run_to_cursor()`, `restart`,
 `pause(thread_id)`, `terminate(opts)`, `disconnect(opts, cb)`, `close()`.
 Stepping: `step_over`, `step_into`, `step_out`, `step_back`, `reverse_continue`.
 Breakpoints: `toggle_breakpoint(cond?, hit?, log?)`, `set_breakpoint(...)`, `clear_breakpoints(all?)`,
@@ -172,7 +174,6 @@ require("lvim-dap").setup({
     },
     persist = {
         breakpoints = false, -- persist breakpoints per project root across sessions
-        last_run = false, -- RESERVED: not yet implemented (run_last is in-memory only)
     },
     on_config = nil, -- fun(config): config — last-chance rewrite of a configuration before it runs
 })

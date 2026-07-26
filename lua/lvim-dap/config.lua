@@ -17,7 +17,6 @@
 
 ---@class LvimDapPersistConfig
 ---@field breakpoints boolean  persist breakpoints per project across sessions
----@field last_run    boolean  RESERVED (not yet implemented): remember the last run per project
 
 ---@class LvimDapConfig
 ---@field log_level            lvim-dap.log.Level   file-log verbosity (trace|debug|info|warn|error)
@@ -58,8 +57,10 @@ return {
         stopped = "➤",
     },
     persist = {
+        -- `run_last` deliberately has NO persistence option: what it holds is not serializable (a live
+        -- parent Session, an adapter table, configs whose `program` is a function), so a stored copy
+        -- would either round-trip wrongly or silently drop. It stays in memory, per Neovim session.
         breakpoints = false,
-        last_run = false, -- RESERVED: not yet implemented (run_last is in-memory only, per Neovim session)
     },
     on_config = nil,
 }

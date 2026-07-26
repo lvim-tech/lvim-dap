@@ -53,7 +53,7 @@ ADDED, never wired into the core. See |lvim-dap-adapters|.
             log_point = "",
             stopped = "➤",
         },
-        persist = { breakpoints = false, last_run = false },
+        persist = { breakpoints = false },
         on_config = nil,
     })
 <
@@ -65,7 +65,6 @@ ADDED, never wired into the core. See |lvim-dap-adapters|.
 `terminal.close_on_exit` close the integrated terminal when the session ends
 `signs`                gutter glyphs (engine-owned; theme from the palette)
 `persist.breakpoints`  persist breakpoints per project root across sessions
-`persist.last_run`     RESERVED: not yet implemented (run_last is in-memory only)
 `on_config`            fun(config): config — rewrite a config before it runs
 
 ==============================================================================
@@ -166,6 +165,11 @@ adapters; `log` opens the log file.
 
 Run control ~
     run({config} [, {opts}])   run_last()   continue([{opts}])
+
+`run_last()` replays the last configuration run in THIS Neovim session — it is
+deliberately in-memory: a launch config can hold a live parent session, an
+adapter table or a function-valued `program`, none of which survive being
+stored, so a persisted copy would silently be wrong.
     run_to_cursor()   restart()   pause([{thread_id}])
     terminate([{opts}])   disconnect([{opts}[, {cb}]])   close()
 
