@@ -14,7 +14,7 @@
 --
 ---@module "lvim-dap.transport"
 
-local uv = vim.uv or vim.loop
+local uv = vim.uv
 local rpc = require("lvim-dap.rpc")
 local log = require("lvim-dap.log")
 

@@ -15,7 +15,7 @@
 --
 ---@module "lvim-dap.session"
 
-local uv = vim.uv or vim.loop
+local uv = vim.uv
 local transport = require("lvim-dap.transport")
 local listeners = require("lvim-dap.listeners")
 local async = require("lvim-dap.async")
