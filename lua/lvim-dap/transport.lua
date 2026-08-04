@@ -108,7 +108,7 @@ end
 --- Build the `{ write, close }` client over a duplex stream (+ optional owned process handle).
 ---@param sink uv.uv_stream_t      where writes go (stdin pipe / the socket)
 ---@param proc? uv.uv_process_t    the spawned process, if we own one
----@param extra? uv.uv_handle_t[]  stray handles to close on teardown (stdout/stderr pipes)
+---@param extra? uv.uv_stream_t[]  stray pipes to close on teardown (stdout/stderr)
 ---@return lvim-dap.TransportClient
 local function make_client(sink, proc, extra)
     return {
@@ -184,7 +184,7 @@ local function spawn(command, args, opts, cbs)
         cwd = opts.cwd,
         env = env,
         detached = opts.detached or false,
-    }, function(code, _signal)
+    }, function(code)
         log.info("transport: adapter exited, code:", code)
         if cbs.on_exit then
             vim.schedule(function()
@@ -234,7 +234,7 @@ end
 ---@param max_retries integer
 ---@param cbs lvim-dap.transport.Callbacks
 ---@param proc? uv.uv_process_t  a server process we spawned and now own
----@param extra? uv.uv_handle_t[]  the server process's stdout/stderr pipes, closed on teardown
+---@param extra? uv.uv_stream_t[]  the server process's stdout/stderr pipes, closed on teardown
 local function tcp_connect(host, port, max_retries, cbs, proc, extra)
     local attempt = 0
     local function try()

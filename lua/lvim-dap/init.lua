@@ -186,11 +186,14 @@ end
 ---@param s lvim-dap.Session
 local function jump_to_frame(s)
     local frame = s.current_frame
-    if not frame or not frame.source or not frame.source.path then
+    if not frame then
+        return
+    end
+    local path = frame.source and frame.source.path
+    if not path then
         return
     end
     vim.fn.sign_unplace("lvim-dap-stopped")
-    local path = frame.source.path
     local bufnr = vim.fn.bufadd(path)
     -- `bufload` can THROW (a stale swap file → E325/ATTENTION aborted, or other load failures); this
     -- runs inside the scheduled frame_updated listener, so an unguarded throw would surface as an
