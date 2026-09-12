@@ -32,7 +32,7 @@ ADDED, never wired into the core. See |lvim-dap-adapters|.
 ==============================================================================
 2. REQUIREMENTS                                            *lvim-dap-requirements*
 
-- Neovim >= 0.10
+- Neovim >= 0.12
 - A debug adapter for your language on $PATH (debugpy, delve, js-debug,
   codelldb, lldb, …). Install with your OS package manager or lvim-installer.
 - lvim-utils (palette, merge, persistence store).

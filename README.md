@@ -32,7 +32,7 @@ port over unchanged.
 
 ## Requirements
 
-- Neovim >= 0.10
+- Neovim >= 0.12
 - A debug adapter for your language on `PATH` (e.g. debugpy for Python, delve for Go,
   js-debug for Node, codelldb/lldb for C/C++/Rust). Install these with your OS package manager
   or the lvim-tech **lvim-installer**.
